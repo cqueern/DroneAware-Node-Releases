@@ -10,6 +10,216 @@ Full release artifacts and discussion notes live at the
 
 ---
 
+## [1.5.0.6] — Unreleased
+
+Installation and adapter-mode correctness. Five defects found in a code
+audit of the v1.5.0.x line following operator reports of failed installs
+and nodes that stopped scanning.
+
+### Nodes could end an update with no WiFi feeder running
+
+`_switch_to_single_adapter_mode` wrote `WIFI_ADAPTER_MAC` but never
+cleared `WIFI_ADAPTER_2G_MAC` / `WIFI_ADAPTER_5G_MAC`. Those two keys
+are how every other code path decides whether the node is in dual mode,
+so a node that had once had two adapters and later resolved to one kept
+being treated as dual. The result was a loop:
+
+1. `_orchestrate_wifi_mode` correctly selects single mode, disables the
+   split units and starts `droneaware-wifi`
+2. `_start_wifi_services_for_current_mode`, at the end of `cmd_update`,
+   re-reads the stale band keys, takes the dual branch, stops
+   `droneaware-wifi` and starts the split units — which were just
+   disabled, and on pre-v1.5.0.4 nodes were not installed at all
+3. the update finishes with no WiFi feeder running, and every later
+   `refresh` or `update` repeats the same sequence
+
+`cmd_status` read the same stale keys, so affected nodes also displayed
+two split-unit rows when they should have shown one.
+
+Fixes:
+- `_switch_to_single_adapter_mode` clears both band keys, so `config.env`
+  is an honest record of the mode. Only writes when a stale value is
+  actually present — a no-op on nodes that have only ever had one adapter.
+- `_start_wifi_services_for_current_mode` no longer takes the dual branch
+  when the split unit files are absent from `/etc/systemd/system/`. It
+  logs the mismatch and starts the single-adapter feeder instead, so a
+  configuration/filesystem disagreement can never leave the node dark.
+
+### The installer could fail silently
+
+`install_packages` sent both `apt-get` calls to `/dev/null 2>&1`. With
+`set -e` active, a non-zero exit aborted the script immediately; when the
+failure occurred before NetworkManager had been touched, the `ERR` trap
+printed nothing either. The installer simply stopped after the
+"Installing System Packages" heading with no message.
+
+The common trigger is an interrupted `dpkg` transaction, which makes apt
+refuse every subsequent operation until `dpkg --configure -a` is run —
+so the install then failed identically on every retry with no diagnostic.
+
+Fixes:
+- apt stderr is no longer discarded; stdout stays quiet.
+- Both apt calls have an explicit failure handler naming the likely
+  causes and the exact remediation command for each.
+- The handler performs the NetworkManager rollback explicitly, because
+  `fatal` exits directly and does not fire the `ERR` trap.
+- `systemctl enable/start bluetooth` are now non-fatal warnings. A node
+  with no Bluetooth hardware can still run the WiFi feeder; previously a
+  masked or absent unit aborted the entire install.
+
+### Fresh installs started feeders before enrollment
+
+`migrate_config` runs `__migrate`, which reaches `_orchestrate_wifi_mode`
+and started the WiFi unit(s) immediately. `enroll_node` — which writes
+`/etc/droneaware/token` — does not run until the following step, so every
+fresh install briefly ran a feeder with no credentials, crash-looping
+under `Restart=always` until the operator rebooted. This also contradicted
+install.sh's own design, in which units are enabled at install time and
+started by the reboot the summary asks for.
+
+Fix: install.sh sets `DRONEAWARE_NO_SERVICE_START=1` for its single
+`__migrate` call. Orchestration still writes config keys and sets
+enable/disable state; it just does not start anything. `refresh` and
+`update` leave the flag unset and start units as before.
+
+### Binaries could be overwritten while in use
+
+Both `install.sh` and `cmd_update` stopped only `droneaware-ble` and
+`droneaware-wifi` before replacing `/opt/droneaware/wifi_feeder`. On a
+dual-adapter node the two split feeders were still running, holding that
+inode as their text image — giving `ETXTBSY` or a truncated binary. In
+install.sh this additionally tripped the `ERR` trap and rolled back
+NetworkManager mid-install.
+
+Fix: both stop lists include `droneaware-wifi-2g` and
+`droneaware-wifi-5g`.
+
+### install-webui dropped dual-adapter nodes to one band
+
+`cmd_install_webui` ended with a hardcoded `systemctl restart
+droneaware-wifi`. On a dual-adapter node that trips the split units'
+`Conflicts=droneaware-wifi.service` clause and stops them, leaving the
+node scanning one band. Same defect class v1.5.0.1 fixed in `cmd_update`;
+this path was missed.
+
+Fix: the restart is mode-aware, routed through
+`_start_wifi_services_for_current_mode`.
+
+### `refresh` left a stopped feeder stopped
+
+The restart decision looked at enable-state, active-state of the *wrong*
+unit, and whether the adapter MACs had changed — but never at whether
+the desired feeder was actually running. A node whose config, enable
+flags and MACs were all correct but whose feeders were stopped (after a
+failed update, a manual stop, or a crash loop that exhausted its restart
+budget) got a `refresh` that reported success and changed nothing.
+
+That is the single most common reason an operator runs `refresh`, and it
+was the one case it did not handle. Pre-v1.5.0.6 had the same gap, so
+this is not a regression — but it defeats the documented purpose of the
+command.
+
+Fix: both mode-switch functions now treat "the units that should be
+running are not running" as a trigger, and say so in the output. Still a
+no-op when everything is already healthy.
+
+### Re-running the installer left both adapter modes enabled
+
+`install_services` unconditionally runs `systemctl enable
+droneaware-wifi`. The dual-mode switch only disabled it when the split
+units were **not** already enabled — true on a first install, false when
+re-running the installer on a node already in dual mode. That node ended
+up with `droneaware-wifi` enabled alongside `droneaware-wifi-2g` and
+`droneaware-wifi-5g`, so all three start on the next boot and fight over
+`Conflicts=`. install.sh tells operators to re-run it after an
+interrupted install, so this is reachable in the field.
+
+Fix: both mode-switch functions now state the desired enable-state and
+enforce it, rather than reacting to a transition they happened to
+observe — the same principle as clearing the stale band keys. The
+restart decision moved to a single place so the log no longer reports an
+action that install-time suppression skipped.
+
+### Web UI binary could never be replaced once installed
+
+`install_webui` wrote over `/opt/droneaware/web_ui` without stopping
+`droneaware-web`. A running process holds its own binary as its text
+image, so the write failed with `ETXTBSY`. In LOCAL_INSTALL mode the copy
+was additionally wrapped in `2>/dev/null`, so the real error was
+discarded and the operator was told `Web UI binary not found in local
+dist` — pointed at a missing file that was present the whole time.
+
+`download_binaries` stops the feeders but never this unit, and
+`cmd_update`'s equivalent stop was never mirrored here.
+
+Fix: stop `droneaware-web` before replacing its binary, and report the
+actual error instead of discarding it.
+
+### `update` ignored pre-release status, so rollbacks did not reach nodes
+
+`cmd_update` read tag names from `GET /releases` and never looked at the
+`prerelease` flag. Marking a release as a pre-release on GitHub moves the
+`Latest` pointer that fresh installs resolve to, but it did not keep
+existing nodes off that release — `sudo droneaware update` would still
+select it. A withdrawn release therefore remained installable on every
+node in the field, and a rollback only ever protected new installs.
+
+The same loop also issued one additional API call per candidate tag,
+against GitHub's 60-requests-per-hour unauthenticated limit.
+
+Fix: a single API call, parsed properly, skipping drafts and
+pre-releases and requiring the `ble_feeder` asset. Sorting is done on
+`published_at` rather than trusting the API's list order, which is not
+stable once pre-releases are present.
+
+The asset test deliberately checks for `ble_feeder` only. Requiring the
+full v1.5.0 asset set would make every pre-v1.5.0 release unselectable
+and remove the ability to roll the fleet back to one.
+
+Release candidates can still be installed on a test node by opting in
+explicitly:
+
+```
+sudo DRONEAWARE_ALLOW_PRERELEASE=1 droneaware update
+```
+
+### Added: under-voltage pre-flight
+
+`install.sh` now reads `vcgencmd get_throttled` before running apt. A Pi
+on a marginal supply browns out under load, and apt — sustained SD writes
+plus CPU — is a frequent victim; the kernel kills it mid-transaction and
+`dpkg` is left interrupted, which is what makes the failure above recur
+on every retry.
+
+Only the under-voltage bits (`0x1`, `0x10000`) gate the install, since
+throttling alone may be thermal. On a non-zero reading the operator sees
+the decoded state, the recommended remedies, and an explicit
+continue/cancel prompt. Silent on `0x0`, and skipped entirely where
+`vcgencmd` is unavailable.
+
+### Files changed
+
+- `droneaware` (CLI) — band-key clearing in `_switch_to_single_adapter_mode`;
+  unit-file presence guard and start-suppression in
+  `_start_wifi_services_for_current_mode`; new `_service_start_suppressed`
+  helper guarding every start/restart in both mode-switch functions;
+  split units added to the `cmd_update` stop list; mode-aware feeder
+  restart in `cmd_install_webui`; enable-state enforcement in both
+  mode-switch functions; not-running feeders started by `refresh`;
+  stable-release selection in `cmd_update`
+  with `DRONEAWARE_ALLOW_PRERELEASE=1` opt-in.
+- `.github/workflows/release.yaml`, `.github/workflows/build.yaml` — new
+  `prerelease` input, so a validation build can be published and tested on
+  real hardware without becoming the `Latest` release that the install
+  snippet resolves to.
+- `install.sh` — apt failure handling with explicit rollback; non-fatal
+  bluetooth setup; split units added to the `download_binaries` stop list;
+  `DRONEAWARE_NO_SERVICE_START=1` on the `__migrate` call; new
+  `_check_undervoltage` pre-flight; `droneaware-web` stopped before its
+  binary is replaced, with the real error surfaced.
+
+---
+
 ## [1.5.0.5] — Unreleased
 
 Release-workflow fix: `.github/workflows/build.yaml` now uploads the
