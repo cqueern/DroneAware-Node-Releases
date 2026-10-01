@@ -32,6 +32,7 @@ import signal
 import threading
 import uuid
 import os
+import random
 import re
 import subprocess
 import sys
@@ -238,6 +239,13 @@ REMOTE_ID_SERVICE_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 # which is fine at a few events per flush and becomes an unbounded request
 # after an outage.
 DEFAULT_DRAIN_BATCH      = 200
+
+# A DNS recovery reconnects the whole fleet at once, and every node with a
+# backlog starts draining in the same second. Nodes with nothing buffered are
+# not the problem and are not delayed; a node holding a real backlog waits a
+# random moment first, so the fleet arrives spread out rather than together.
+DRAIN_START_JITTER_SEC = 90.0
+DRAIN_JITTER_BACKLOG = 500
 DEFAULT_BUFFER_MAX_BYTES = 50_000_000
 DEFAULT_BUFFER_WARN_PCT  = 75
 
@@ -1544,10 +1552,13 @@ class Forwarder:
         self.last_flush        = time.monotonic()
         self.sent_total        = 0
         self.dropped_total     = 0
+        # Records the server reported it did not retain.
+        self.shed_total        = 0
         self._warned_high      = False  # one-shot, resets when the spool drains
         # v1.5.1: the batch currently being delivered, held across retries as
         # (idempotency_key, events, mark). Mirrors wifi_feeder — see _flush().
         self._inflight         = None
+        self._drain_jitter_done = False
         # Advisory pacing from the server's last reply. Not a 429 — deliberately
         # so, since a node must not re-send its buffer under load.
         self._pace_until       = 0.0
@@ -1624,6 +1635,20 @@ class Forwarder:
         self.spool.commit_staged()
         self.spool.prune()
 
+        # First drain of this process, and there is a real backlog behind it:
+        # wait a random moment so a fleet-wide reconnect does not arrive as one
+        # spike. Live traffic on a node with nothing buffered is never delayed.
+        if not self._drain_jitter_done:
+            self._drain_jitter_done = True
+            if self.held_events >= DRAIN_JITTER_BACKLOG:
+                delay = random.uniform(0.0, DRAIN_START_JITTER_SEC)
+                self._pace_until = time.time() + delay
+                log.info("[spool] %d events to send; starting in %.0fs so the "
+                         "fleet does not reconnect in one spike.",
+                         self.held_events, delay)
+                return
+
+
         # v1.5.1: a batch is assembled ONCE, stamped with an idempotency key,
         # and retried byte-identical until it is delivered or abandoned.
         # Previously a failed batch was pushed back onto the front of the deque
@@ -1676,7 +1701,7 @@ class Forwarder:
                 self._inflight = None
             self.sent_total += len(events)
             ENDPOINT.record_success()
-            self._read_pacing_hint(r)
+            self._read_upload_reply(r)
             log.debug(f"Sent {len(events)} events ({self.sent_total} total)")
         except requests.RequestException as e:
             # A 4xx will never be accepted however many times it is offered,
@@ -1709,20 +1734,39 @@ class Forwarder:
                 f"dropped_total={self.dropped_total})"
             )
 
-    def _read_pacing_hint(self, r):
-        """Honour next_batch_after_ms if the server sent one.
+    def _read_upload_reply(self, r):
+        """Honour the server's pacing guidance, and record what it reports.
 
-        Advisory and optional: an older server, a proxy that rewrites bodies,
-        or a non-JSON reply all mean 'no hint', never an error. The node has
-        never parsed this response body before, so the parse itself is a new
-        failure mode — it fails silently and changes nothing.
+        The reply can ask the node to wait before sending again, and can report
+        a count of records the server did not retain. Both are advisory: an
+        older server, a proxy that rewrites bodies, or a non-JSON reply all
+        mean 'nothing to read', never an error.
+
+        Records reported this way are not re-sent. The batch was accepted, so
+        sending it again would simply duplicate it, and a node that reacts to
+        the report by pushing harder is the opposite of what the guidance asks
+        for. They stay on disk under the ordinary retention rules; what this
+        adds is that the count is visible rather than silent.
         """
         try:
-            hint = float(r.json().get("next_batch_after_ms") or 0) / 1000.0
+            body = r.json()
         except Exception:
             return
+        try:
+            hint = float(body.get("next_batch_after_ms") or 0) / 1000.0
+        except Exception:
+            hint = 0.0
         if 0 < hint <= 3600:
             self._pace_until = time.monotonic() + hint
+        try:
+            shed = int(body.get("shed") or 0)
+        except Exception:
+            return
+        if shed > 0:
+            self.shed_total += shed
+            log.warning("[upload] the server did not retain %d record(s) from this "
+                        "batch (%d total) and asked the node to pause.",
+                        shed, self.shed_total)
 
     def _maybe_warn(self):
         """One warning per fill, one info on drain."""
@@ -2193,6 +2237,9 @@ class BLEFeeder:
                    for k, v in _adapter_hardware(adapter or "hci0").items()},
                 "sent_total": getattr(getattr(self, "forwarder", None),
                                       "sent_total", 0),
+                # Records the server reported it did not retain.
+                "shed_total": getattr(getattr(self, "forwarder", None),
+                                      "shed_total", 0),
                 "updated_at": time.time(),
             }
             tmp = path + ".tmp"
@@ -2300,6 +2347,7 @@ class BLEFeeder:
                                 "buffered":                   self.forwarder.held_events,
                                 "buffered_bytes":             self.forwarder.held_bytes,
                                 "dropped_total":              self.forwarder.dropped_total,
+                                "shed_total":                 self.forwarder.shed_total,
                                 "sent_total":                 self.forwarder.sent_total,
                                 # A spool that quietly fails to replay looks
                                 # exactly like a quiet week of airspace, so
